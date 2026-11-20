@@ -1,0 +1,85 @@
+name: Publish verified TrailSync APK
+on:
+  push:
+    branches: [main]
+    paths: [release-candidate.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+concurrency: trailsync-public-release
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Recover exact signed candidate
+        run: |
+          set -euo pipefail
+          apk="$RUNNER_TEMP/app-release.apk"
+          : > "$apk"
+          jq -er '.blobs[]' release-candidate.json > "$RUNNER_TEMP/parts"
+          while read -r sha; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$sha" --jq '.content' | base64 -d >> "$apk"
+          done < "$RUNNER_TEMP/parts"
+          expected=$(jq -er '.sha256' release-candidate.json)
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          echo "$expected  $apk" | sha256sum -c -
+      - name: Verify permanent signer, package and upgrade version
+        run: |
+          set -euo pipefail
+          apk="$RUNNER_TEMP/app-release.apk"
+          bin="$ANDROID_HOME/build-tools/35.0.0"
+          cert() { "$bin/apksigner" verify --print-certs "$1" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p'; }
+          signer=$(cert "$apk")
+          [[ "$signer" == 6ea391f8ddbc7b48a1c0c48bc8c8f6448355cc12746f408114923a84defd4943 ]]
+          package() { "$bin/aapt" dump badging "$1" | sed -n "s/^package: .*\b$2='\([^']*\)'.*/\1/p"; }
+          version=$(package "$apk" versionName)
+          code=$(package "$apk" versionCode)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$code" =~ ^[1-9][0-9]*$ ]]
+          [[ "$(package "$apk" name)" == za.co.garvis.expedition01 ]]
+          [[ "$version" == "$(jq -er '.version' release-candidate.json)" && "$code" == "$(jq -er '.versionCode' release-candidate.json)" ]]
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          mkdir "$RUNNER_TEMP/previous"
+          gh release download "$latest" --pattern app-release.apk --dir "$RUNNER_TEMP/previous"
+          old="$RUNNER_TEMP/previous/app-release.apk"
+          [[ "$(cert "$old")" == "$signer" && "$(package "$old" name)" == "$(package "$apk" name)" ]]
+          if [[ "$latest" == "v$version" ]]; then
+            cmp "$apk" "$old"
+            echo 'ALREADY_LIVE=true' >> "$GITHUB_ENV"
+          else
+            previous_code=$(package "$old" versionCode)
+            [[ "$previous_code" =~ ^[1-9][0-9]*$ && "$code" -gt "$previous_code" ]]
+          fi
+          printf 'TAG=v%s\nCODE=%s\n' "$version" "$code" >> "$GITHUB_ENV"
+      - name: Verify draft asset and publish
+        if: env.ALREADY_LIVE != 'true'
+        run: |
+          set -euo pipefail
+          apk="$RUNNER_TEMP/app-release.apk"
+          if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/draft"; then
+            grep -qx true "$RUNNER_TEMP/draft"
+          else
+            notes=$(printf 'TrailSync Android update.\n\nversionCode: %s\n\nSHA-256: %s' "$CODE" "$(jq -r .sha256 release-candidate.json)")
+            gh release create "$TAG" --target "$GITHUB_SHA" --draft --title "TrailSync $TAG" --notes "$notes"
+          fi
+          if ! gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx app-release.apk; then
+            gh release upload "$TAG" "$apk"
+          fi
+          mkdir "$RUNNER_TEMP/staged"
+          gh release download "$TAG" --pattern app-release.apk --dir "$RUNNER_TEMP/staged"
+          cmp "$apk" "$RUNNER_TEMP/staged/app-release.apk"
+          gh release edit "$TAG" --draft=false --latest
+      - name: Verify updater feed and public download
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/release.json"
+          jq -e --arg tag "$TAG" --arg code "$CODE" '.tag_name==$tag and (.body|contains("versionCode: "+$code))' "$RUNNER_TEMP/release.json"
+          url=$(jq -er '[.assets[]|select(.name=="app-release.apk")]|select(length==1)|.[0].browser_download_url' "$RUNNER_TEMP/release.json")
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/public.apk"
+          cmp "$RUNNER_TEMP/app-release.apk" "$RUNNER_TEMP/public.apk"
